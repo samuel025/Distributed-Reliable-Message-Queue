@@ -1,39 +1,92 @@
 package com.drmq.broker;
 
+import com.drmq.broker.persistence.LogManager;
+import com.drmq.broker.persistence.LogSegment;
 import com.drmq.protocol.DRMQProtocol.StoredMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * In-memory message storage for the broker.
- * Thread-safe storage of messages organized by topic with monotonically increasing offsets.
- * 
- * This is the Phase 1 implementation - messages are stored in memory only.
- * Phase 2 will add write-ahead logging for persistence.
+ * Message storage for the broker.
+ * Phase 2: Implements persistence using Write-Ahead Logging (WAL) and an in-memory index.
  */
 public class MessageStore {
     private static final Logger logger = LoggerFactory.getLogger(MessageStore.class);
 
-    // Global offset counter - monotonically increasing across all topics
     private final AtomicLong globalOffset = new AtomicLong(0);
+    private final LogManager logManager;
 
-    // Topic -> List of messages mapping
-    private final ConcurrentHashMap<String, List<StoredMessage>> topicMessages = new ConcurrentHashMap<>();
+    // Topic -> Offset -> Byte Position in log file
+    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> topicIndex = new ConcurrentHashMap<>();
+    
+    // In-memory cache for recent messages (Topic -> List)
+    private final ConcurrentHashMap<String, List<StoredMessage>> messageCache = new ConcurrentHashMap<>();
+
+    public MessageStore(LogManager logManager) {
+        this.logManager = logManager;
+    }
+
+    /**
+     * Recovery: Rebuild the index from log files on disk.
+     */
+    public void recover() throws IOException {
+        logger.info("Starting message store recovery...");
+        Map<String, Path> segments = logManager.discoverSegments();
+        long maxOffset = -1;
+
+        for (Map.Entry<String, Path> entry : segments.entrySet()) {
+            String topic = entry.getKey();
+            Path logPath = entry.getValue();
+            
+            try (LogSegment segment = new LogSegment(logPath)) {
+                long position = 0;
+                long segmentSize = segment.getSize();
+                
+                while (position < segmentSize) {
+                    StoredMessage message = segment.read(position);
+                    long offset = message.getOffset();
+                    
+                    indexMessage(topic, offset, position);
+                    // Also add to cache during recovery for now
+                    addToCache(topic, message);
+                    
+                    if (offset > maxOffset) {
+                        maxOffset = offset;
+                    }
+                    
+                    // Move to next message: 4 bytes (length) + message size
+                    position += 4 + message.getSerializedSize();
+                }
+            } catch (Exception e) {
+                logger.error("Error recovering topic {}: {}", topic, e.getMessage());
+            }
+        }
+
+        globalOffset.set(maxOffset + 1);
+        logger.info("Recovery complete. Global offset set to {}", globalOffset.get());
+    }
+
+    private void indexMessage(String topic, long offset, long position) {
+        topicIndex.computeIfAbsent(topic, k -> new ConcurrentHashMap<>())
+                .put(offset, position);
+    }
+
+    private void addToCache(String topic, StoredMessage message) {
+        messageCache.computeIfAbsent(topic, k -> Collections.synchronizedList(new ArrayList<>()))
+                .add(message);
+    }
 
     /**
      * Append a message to the specified topic.
-     *
-     * @param topic   The topic name
-     * @param payload The message payload bytes
-     * @param key     Optional message key (may be null)
-     * @param clientTimestamp The client-provided timestamp
-     * @return The assigned offset for this message
      */
     public long append(String topic, byte[] payload, String key, long clientTimestamp) {
         long offset = globalOffset.getAndIncrement();
@@ -52,51 +105,64 @@ public class MessageStore {
 
         StoredMessage message = builder.build();
 
-        // Get or create the message list for this topic
-        List<StoredMessage> messages = topicMessages.computeIfAbsent(topic, 
-                k -> Collections.synchronizedList(new ArrayList<>()));
-        messages.add(message);
+        try {
+            // 1. Persist to WAL
+            LogSegment segment = logManager.getOrCreateSegment(topic);
+            long position = segment.append(message);
 
-        logger.debug("Stored message: topic={}, offset={}, size={} bytes", 
-                topic, offset, payload.length);
+            // 2. Update Index
+            indexMessage(topic, offset, position);
+
+            // 3. Update Cache
+            addToCache(topic, message);
+
+            logger.debug("Persisted and indexed message: topic={}, offset={}, position={}", 
+                    topic, offset, position);
+
+        } catch (IOException e) {
+            logger.error("Failed to persist message for topic {}: {}", topic, e.getMessage());
+            throw new RuntimeException("Persistence failure", e);
+        }
 
         return offset;
     }
 
     /**
      * Get a message by topic and offset.
-     *
-     * @param topic  The topic name
-     * @param offset The message offset
-     * @return The stored message, or null if not found
      */
     public StoredMessage getMessage(String topic, long offset) {
-        List<StoredMessage> messages = topicMessages.get(topic);
-        if (messages == null) {
-            return null;
-        }
-
-        // Linear search - acceptable for Phase 1, will be optimized with index in Phase 2
-        synchronized (messages) {
-            for (StoredMessage msg : messages) {
-                if (msg.getOffset() == offset) {
-                    return msg;
+        // First try cache
+        List<StoredMessage> messages = messageCache.get(topic);
+        if (messages != null) {
+            synchronized (messages) {
+                for (StoredMessage msg : messages) {
+                    if (msg.getOffset() == offset) return msg;
                 }
             }
         }
+
+        // Then try index + disk
+        Map<Long, Long> index = topicIndex.get(topic);
+        if (index != null && index.containsKey(offset)) {
+            try {
+                long position = index.get(offset);
+                LogSegment segment = logManager.getOrCreateSegment(topic);
+                return segment.read(position);
+            } catch (IOException e) {
+                logger.error("Error reading message from disk: topic={}, offset={}", topic, offset, e);
+            }
+        }
+
         return null;
     }
 
     /**
      * Get messages from a topic starting at the given offset.
-     *
-     * @param topic     The topic name
-     * @param fromOffset Starting offset (inclusive)
-     * @param maxCount  Maximum number of messages to return
-     * @return List of messages, may be empty
      */
     public List<StoredMessage> getMessages(String topic, long fromOffset, int maxCount) {
-        List<StoredMessage> messages = topicMessages.get(topic);
+        // For Phase 2, we'll leverage the cache if possible, or read from disk sequentially.
+        // Keeping it simple: filter the cache for now, as recovery loads everything into cache.
+        List<StoredMessage> messages = messageCache.get(topic);
         if (messages == null) {
             return Collections.emptyList();
         }
@@ -115,34 +181,25 @@ public class MessageStore {
         return result;
     }
 
-    /**
-     * Get the current global offset (next offset to be assigned).
-     */
     public long getCurrentOffset() {
         return globalOffset.get();
     }
 
-    /**
-     * Get the number of messages in a topic.
-     */
     public int getMessageCount(String topic) {
-        List<StoredMessage> messages = topicMessages.get(topic);
-        return messages == null ? 0 : messages.size();
+        Map<Long, Long> index = topicIndex.get(topic);
+        return index == null ? 0 : index.size();
     }
 
-    /**
-     * Get all topic names.
-     */
     public List<String> getTopics() {
-        return new ArrayList<>(topicMessages.keySet());
+        return new ArrayList<>(topicIndex.keySet());
     }
 
-    /**
-     * Clear all messages (for testing purposes).
-     */
     public void clear() {
-        topicMessages.clear();
+        topicIndex.clear();
+        messageCache.clear();
         globalOffset.set(0);
-        logger.info("Message store cleared");
+        // Note: This doesn't delete files from disk for safety, but clears memory view.
+        logger.info("Message store memory state cleared");
     }
 }
+
