@@ -3,6 +3,9 @@ package com.drmq.integration;
 import com.drmq.broker.BrokerServer;
 import com.drmq.client.DRMQProducer;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -11,12 +14,15 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class ProducerBrokerIntegrationTest {
 
+    @TempDir
+    Path tempDir;
+
     private static final int TEST_PORT = 19092;
     private BrokerServer broker;
 
     @BeforeEach
     void setUp() throws Exception {
-        broker = new BrokerServer(TEST_PORT, 5);
+        broker = new BrokerServer(TEST_PORT, 5, tempDir.toString());
         broker.startAsync();
         
         // Wait for broker to be ready
