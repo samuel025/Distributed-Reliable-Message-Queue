@@ -1,5 +1,6 @@
 package com.drmq.broker;
 
+import com.drmq.broker.persistence.LogManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -14,31 +15,37 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * DRMQ Broker Server - TCP server accepting producer connections.
- * 
- * Uses a thread pool to handle concurrent client connections.
- * Each connection is managed by a ClientHandler.
  */
 public class BrokerServer {
     private static final Logger logger = LoggerFactory.getLogger(BrokerServer.class);
 
     public static final int DEFAULT_PORT = 9092;
     public static final int DEFAULT_THREAD_POOL_SIZE = 10;
+    public static final String DEFAULT_DATA_DIR = "./data";
 
     private final int port;
+    private final String dataDir;
     private final ExecutorService executor;
     private final MessageStore messageStore;
+    private final LogManager logManager;
     private final List<ClientHandler> activeHandlers = new ArrayList<>();
 
     private ServerSocket serverSocket;
     private volatile boolean running = false;
 
-    public BrokerServer(int port, int threadPoolSize) {
+    public BrokerServer(int port, int threadPoolSize, String dataDir) throws IOException {
         this.port = port;
+        this.dataDir = dataDir;
         this.executor = Executors.newFixedThreadPool(threadPoolSize);
-        this.messageStore = new MessageStore();
+        this.logManager = new LogManager(dataDir);
+        this.messageStore = new MessageStore(logManager);
     }
 
-    public BrokerServer() {
+    public BrokerServer(int port, int threadPoolSize) throws IOException {
+        this(port, threadPoolSize, DEFAULT_DATA_DIR);
+    }
+
+    public BrokerServer() throws IOException {
         this(DEFAULT_PORT, DEFAULT_THREAD_POOL_SIZE);
     }
 
@@ -46,10 +53,18 @@ public class BrokerServer {
      * Start the broker server. Blocks until shutdown.
      */
     public void start() throws IOException {
+        // Recovery phase
+        try {
+            messageStore.recover();
+        } catch (IOException e) {
+            logger.error("Failed to recover message store: {}", e.getMessage());
+            throw e;
+        }
+
         serverSocket = new ServerSocket(port);
         running = true;
 
-        logger.info("DRMQ Broker started on port {}", port);
+        logger.info("DRMQ Broker started on port {} with data directory {}", port, dataDir);
 
         while (running) {
             try {
@@ -118,6 +133,15 @@ public class BrokerServer {
             activeHandlers.clear();
         }
 
+        // Close LogManager
+        try {
+            if (logManager != null) {
+                logManager.close();
+            }
+        } catch (IOException e) {
+            logger.error("Error closing log manager", e);
+        }
+
         // Shutdown executor
         executor.shutdown();
         try {
@@ -132,23 +156,14 @@ public class BrokerServer {
         logger.info("Broker shutdown complete");
     }
 
-    /**
-     * Check if the broker is running.
-     */
     public boolean isRunning() {
         return running;
     }
 
-    /**
-     * Get the message store (for testing).
-     */
     public MessageStore getMessageStore() {
         return messageStore;
     }
 
-    /**
-     * Get the port the broker is listening on.
-     */
     public int getPort() {
         return port;
     }
@@ -158,6 +173,8 @@ public class BrokerServer {
      */
     public static void main(String[] args) {
         int port = DEFAULT_PORT;
+        String dataDir = DEFAULT_DATA_DIR;
+        
         if (args.length > 0) {
             try {
                 port = Integer.parseInt(args[0]);
@@ -166,13 +183,17 @@ public class BrokerServer {
                 System.exit(1);
             }
         }
-
-        BrokerServer broker = new BrokerServer(port, DEFAULT_THREAD_POOL_SIZE);
-
-        // Add shutdown hook for graceful shutdown
-        Runtime.getRuntime().addShutdownHook(new Thread(broker::shutdown));
+        
+        if (args.length > 1) {
+            dataDir = args[1];
+        }
 
         try {
+            BrokerServer broker = new BrokerServer(port, DEFAULT_THREAD_POOL_SIZE, dataDir);
+            
+            // Add shutdown hook for graceful shutdown
+            Runtime.getRuntime().addShutdownHook(new Thread(broker::shutdown));
+            
             broker.start();
         } catch (IOException e) {
             logger.error("Failed to start broker", e);
@@ -180,3 +201,4 @@ public class BrokerServer {
         }
     }
 }
+
