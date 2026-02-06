@@ -1,8 +1,13 @@
 package com.drmq.broker;
 
+import com.drmq.broker.persistence.LogManager;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -16,11 +21,23 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class MessageStoreTest {
 
+    @TempDir
+    Path tempDir;
+
+    private LogManager logManager;
     private MessageStore store;
 
     @BeforeEach
-    void setUp() {
-        store = new MessageStore();
+    void setUp() throws IOException {
+        logManager = new LogManager(tempDir.toString());
+        store = new MessageStore(logManager);
+    }
+
+    @AfterEach
+    void tearDown() throws IOException {
+        if (logManager != null) {
+            logManager.close();
+        }
     }
 
     @Test
@@ -114,6 +131,37 @@ class MessageStoreTest {
     }
 
     @Test
+    void recoverRebuildsIndexFromDisk() throws IOException {
+        String topic = "persistence-test";
+        store.append(topic, "msg1".getBytes(), null, 1000L);
+        store.append(topic, "msg2".getBytes(), "key2", 2000L);
+        
+        long lastOffset = store.getCurrentOffset();
+        
+        // Close and recreate store
+        logManager.close();
+        
+        LogManager newLogManager = new LogManager(tempDir.toString());
+        MessageStore newStore = new MessageStore(newLogManager);
+        
+        newStore.recover();
+        
+        assertEquals(lastOffset, newStore.getCurrentOffset());
+        assertEquals(2, newStore.getMessageCount(topic));
+        
+        var msg1 = newStore.getMessage(topic, 0);
+        assertNotNull(msg1);
+        assertEquals("msg1", new String(msg1.getPayload().toByteArray()));
+        
+        var msg2 = newStore.getMessage(topic, 1);
+        assertNotNull(msg2);
+        assertEquals("msg2", new String(msg2.getPayload().toByteArray()));
+        assertEquals("key2", msg2.getKey());
+        
+        newLogManager.close();
+    }
+
+    @Test
     void clearResetsStore() {
         store.append("test", "msg".getBytes(), null, System.currentTimeMillis());
         assertEquals(1, store.getCurrentOffset());
@@ -139,3 +187,4 @@ class MessageStoreTest {
         assertTrue(topics.contains("gamma"));
     }
 }
+
