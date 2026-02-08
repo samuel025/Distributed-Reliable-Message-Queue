@@ -141,24 +141,23 @@ class MessageStoreTest {
         // Close and recreate store
         logManager.close();
         
-        LogManager newLogManager = new LogManager(tempDir.toString());
-        MessageStore newStore = new MessageStore(newLogManager);
-        
-        newStore.recover();
-        
-        assertEquals(lastOffset, newStore.getCurrentOffset());
-        assertEquals(2, newStore.getMessageCount(topic));
-        
-        var msg1 = newStore.getMessage(topic, 0);
-        assertNotNull(msg1);
-        assertEquals("msg1", new String(msg1.getPayload().toByteArray()));
-        
-        var msg2 = newStore.getMessage(topic, 1);
-        assertNotNull(msg2);
-        assertEquals("msg2", new String(msg2.getPayload().toByteArray()));
-        assertEquals("key2", msg2.getKey());
-        
-        newLogManager.close();
+        try (LogManager newLogManager = new LogManager(tempDir.toString())) {
+            MessageStore newStore = new MessageStore(newLogManager);
+            
+            newStore.recover();
+            
+            assertEquals(lastOffset, newStore.getCurrentOffset());
+            assertEquals(2, newStore.getMessageCount(topic));
+            
+            var msg1 = newStore.getMessage(topic, 0);
+            assertNotNull(msg1);
+            assertEquals("msg1", new String(msg1.getPayload().toByteArray()));
+            
+            var msg2 = newStore.getMessage(topic, 1);
+            assertNotNull(msg2);
+            assertEquals("msg2", new String(msg2.getPayload().toByteArray()));
+            assertEquals("key2", msg2.getKey());
+        }
     }
 
     @Test
