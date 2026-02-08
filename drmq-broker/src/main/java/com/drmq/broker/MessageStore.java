@@ -13,6 +13,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -26,7 +27,8 @@ public class MessageStore {
     private final LogManager logManager;
 
     // Topic -> Offset -> Byte Position in log file
-    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> topicIndex = new ConcurrentHashMap<>();
+    // Using ConcurrentSkipListMap for efficient sorted traversal of sparse offsets
+    private final ConcurrentHashMap<String, ConcurrentSkipListMap<Long, Long>> topicIndex = new ConcurrentHashMap<>();
     
     // In-memory cache for recent messages (Topic -> BoundedMessageCache)
     private final ConcurrentHashMap<String, BoundedMessageCache> messageCache = new ConcurrentHashMap<>();
@@ -80,7 +82,7 @@ public class MessageStore {
     }
 
     private void indexMessage(String topic, long offset, long position) {
-        topicIndex.computeIfAbsent(topic, k -> new ConcurrentHashMap<>())
+        topicIndex.computeIfAbsent(topic, k -> new ConcurrentSkipListMap<>())
                 .put(offset, position);
     }
 
@@ -159,16 +161,60 @@ public class MessageStore {
 
     /**
      * Get messages from a topic starting at the given offset.
+     * First tries the in-memory cache, then falls back to disk if needed.
+     * 
+     * Note: Offsets are global across all topics, so a topic's offsets may be sparse.
+     * We iterate actual index entries rather than probing consecutive offsets.
      */
     public List<StoredMessage> getMessages(String topic, long fromOffset, int maxCount) {
-        // For Phase 2, we'll leverage the cache if possible, or read from disk sequentially.
-        // Keeping it simple: filter the cache for now, as recovery loads everything into cache.
         BoundedMessageCache cache = messageCache.get(topic);
-        if (cache == null) {
+        
+        // Try cache first
+        if (cache != null) {
+            List<StoredMessage> cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
+            // If we got enough messages from cache, return them
+            if (cachedMessages.size() >= maxCount) {
+                return cachedMessages;
+            }
+        }
+        
+        // Cache miss or partial hit - need to read from disk
+        ConcurrentSkipListMap<Long, Long> index = topicIndex.get(topic);
+        if (index == null) {
             return Collections.emptyList();
         }
-
-        return cache.getMessagesFrom(fromOffset, maxCount);
+        
+        List<StoredMessage> result = new ArrayList<>();
+        
+        // Get segment once outside the loop for efficiency
+        LogSegment segment;
+        try {
+            segment = logManager.getOrCreateSegment(topic);
+        } catch (IOException e) {
+            logger.error("Failed to get segment for topic {}: {}", topic, e.getMessage());
+            return Collections.emptyList();
+        }
+        
+        // Iterate actual index entries (sparse offsets) starting from fromOffset
+        // tailMap(fromOffset) returns all entries with key >= fromOffset, already sorted
+        for (Map.Entry<Long, Long> entry : index.tailMap(fromOffset).entrySet()) {
+            if (result.size() >= maxCount) {
+                break;  // Got enough messages
+            }
+            
+            long offset = entry.getKey();
+            long position = entry.getValue();
+            
+            try {
+                StoredMessage message = segment.read(position);
+                result.add(message);
+            } catch (IOException e) {
+                logger.warn("Error reading message at offset {} from disk: {}", offset, e.getMessage());
+                // Continue to next message
+            }
+        }
+        
+        return result;
     }
 
     public long getCurrentOffset() {
