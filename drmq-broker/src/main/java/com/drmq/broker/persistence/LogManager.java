@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
@@ -19,6 +20,7 @@ public class LogManager implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(LogManager.class);
     private static final String DEFAULT_DATA_DIR = "./data";
     private static final String LOG_FILE_SUFFIX = ".log";
+    private static final Pattern TOPIC_NAME_PATTERN = Pattern.compile("^[A-Za-z0-9._-]+$");
 
     private final Path dataDir;
     private final Map<String, LogSegment> topicSegments = new ConcurrentHashMap<>();
@@ -39,19 +41,36 @@ public class LogManager implements AutoCloseable {
      * Get or create a log segment for a topic.
      */
     public LogSegment getOrCreateSegment(String topic) throws IOException {
-        return topicSegments.computeIfAbsent(topic, t -> {
-            try {
-                Path topicDir = dataDir.resolve(t);
-                if (!Files.exists(topicDir)) {
-                    Files.createDirectories(topicDir);
-                }
-                // For Phase 2, we use a single segment "00000000.log" per topic
-                Path logPath = topicDir.resolve("00000000" + LOG_FILE_SUFFIX);
-                return new LogSegment(logPath);
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to create log segment for topic: " + t, e);
+        // Validate topic name to prevent path traversal and invalid characters
+        if (!TOPIC_NAME_PATTERN.matcher(topic).matches()) {
+            throw new IllegalArgumentException(
+                "Invalid topic name: '" + topic + "'. Topic names must match pattern: [A-Za-z0-9._-]+");
+        }
+        
+        // Check if segment already exists
+        LogSegment existing = topicSegments.get(topic);
+        if (existing != null) {
+            return existing;
+        }
+        
+        // Create new segment (synchronized to avoid race conditions)
+        synchronized (this) {
+            // Double-check after acquiring lock
+            existing = topicSegments.get(topic);
+            if (existing != null) {
+                return existing;
             }
-        });
+            
+            Path topicDir = dataDir.resolve(topic);
+            if (!Files.exists(topicDir)) {
+                Files.createDirectories(topicDir);
+            }
+            // For Phase 2, we use a single segment "00000000.log" per topic
+            Path logPath = topicDir.resolve("00000000" + LOG_FILE_SUFFIX);
+            LogSegment segment = new LogSegment(logPath);
+            topicSegments.put(topic, segment);
+            return segment;
+        }
     }
 
     /**
@@ -76,9 +95,27 @@ public class LogManager implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        for (LogSegment segment : topicSegments.values()) {
-            segment.close();
+        IOException primaryException = null;
+        
+        // Attempt to close all segments, collecting exceptions
+        for (Map.Entry<String, LogSegment> entry : topicSegments.entrySet()) {
+            try {
+                entry.getValue().close();
+            } catch (IOException e) {
+                logger.error("Error closing segment for topic {}: {}", entry.getKey(), e.getMessage(), e);
+                if (primaryException == null) {
+                    primaryException = e;
+                } else {
+                    primaryException.addSuppressed(e);
+                }
+            }
         }
+        
         topicSegments.clear();
+        
+        // Rethrow primary exception if any close failed
+        if (primaryException != null) {
+            throw primaryException;
+        }
     }
 }

@@ -28,8 +28,11 @@ public class MessageStore {
     // Topic -> Offset -> Byte Position in log file
     private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> topicIndex = new ConcurrentHashMap<>();
     
-    // In-memory cache for recent messages (Topic -> List)
-    private final ConcurrentHashMap<String, List<StoredMessage>> messageCache = new ConcurrentHashMap<>();
+    // In-memory cache for recent messages (Topic -> BoundedMessageCache)
+    private final ConcurrentHashMap<String, BoundedMessageCache> messageCache = new ConcurrentHashMap<>();
+    
+    // Maximum number of messages to keep in memory per topic
+    private static final int MAX_CACHE_SIZE_PER_TOPIC = 1000;
 
     public MessageStore(LogManager logManager) {
         this.logManager = logManager;
@@ -66,8 +69,9 @@ public class MessageStore {
                     // Move to next message: 4 bytes (length) + message size
                     position += 4 + message.getSerializedSize();
                 }
-            } catch (Exception e) {
-                logger.error("Error recovering topic {}: {}", topic, e.getMessage());
+            } catch (IOException ioe) {
+                logger.error("Error recovering topic {}: {}", topic, ioe.getMessage(), ioe);
+                throw ioe;
             }
         }
 
@@ -81,7 +85,7 @@ public class MessageStore {
     }
 
     private void addToCache(String topic, StoredMessage message) {
-        messageCache.computeIfAbsent(topic, k -> Collections.synchronizedList(new ArrayList<>()))
+        messageCache.computeIfAbsent(topic, k -> new BoundedMessageCache(MAX_CACHE_SIZE_PER_TOPIC))
                 .add(message);
     }
 
@@ -132,13 +136,10 @@ public class MessageStore {
      */
     public StoredMessage getMessage(String topic, long offset) {
         // First try cache
-        List<StoredMessage> messages = messageCache.get(topic);
-        if (messages != null) {
-            synchronized (messages) {
-                for (StoredMessage msg : messages) {
-                    if (msg.getOffset() == offset) return msg;
-                }
-            }
+        BoundedMessageCache cache = messageCache.get(topic);
+        if (cache != null) {
+            StoredMessage msg = cache.get(offset);
+            if (msg != null) return msg;
         }
 
         // Then try index + disk
@@ -162,23 +163,12 @@ public class MessageStore {
     public List<StoredMessage> getMessages(String topic, long fromOffset, int maxCount) {
         // For Phase 2, we'll leverage the cache if possible, or read from disk sequentially.
         // Keeping it simple: filter the cache for now, as recovery loads everything into cache.
-        List<StoredMessage> messages = messageCache.get(topic);
-        if (messages == null) {
+        BoundedMessageCache cache = messageCache.get(topic);
+        if (cache == null) {
             return Collections.emptyList();
         }
 
-        List<StoredMessage> result = new ArrayList<>();
-        synchronized (messages) {
-            for (StoredMessage msg : messages) {
-                if (msg.getOffset() >= fromOffset) {
-                    result.add(msg);
-                    if (result.size() >= maxCount) {
-                        break;
-                    }
-                }
-            }
-        }
-        return result;
+        return cache.getMessagesFrom(fromOffset, maxCount);
     }
 
     public long getCurrentOffset() {
@@ -200,6 +190,61 @@ public class MessageStore {
         globalOffset.set(0);
         // Note: This doesn't delete files from disk for safety, but clears memory view.
         logger.info("Message store memory state cleared");
+    }
+
+    /**
+     * Bounded cache for messages with LRU eviction.
+     * Thread-safe implementation using ArrayDeque with fixed capacity.
+     */
+    private static class BoundedMessageCache {
+        private final int maxSize;
+        private final Map<Long, StoredMessage> messageMap = new ConcurrentHashMap<>();
+        private final java.util.Deque<Long> offsetQueue = new java.util.ArrayDeque<>();
+
+        public BoundedMessageCache(int maxSize) {
+            this.maxSize = maxSize;
+        }
+
+        public synchronized void add(StoredMessage message) {
+            long offset = message.getOffset();
+            
+            // If already exists, update it (shouldn't happen in normal operation)
+            if (messageMap.containsKey(offset)) {
+                return;
+            }
+            
+            // Evict oldest if at capacity
+            if (offsetQueue.size() >= maxSize) {
+                Long oldestOffset = offsetQueue.pollFirst();
+                if (oldestOffset != null) {
+                    messageMap.remove(oldestOffset);
+                }
+            }
+            
+            // Add new message
+            messageMap.put(offset, message);
+            offsetQueue.addLast(offset);
+        }
+
+        public synchronized StoredMessage get(long offset) {
+            return messageMap.get(offset);
+        }
+
+        public synchronized List<StoredMessage> getMessagesFrom(long fromOffset, int maxCount) {
+            List<StoredMessage> result = new ArrayList<>();
+            for (Long offset : offsetQueue) {
+                if (offset >= fromOffset) {
+                    StoredMessage msg = messageMap.get(offset);
+                    if (msg != null) {
+                        result.add(msg);
+                        if (result.size() >= maxCount) {
+                            break;
+                        }
+                    }
+                }
+            }
+            return result;
+        }
     }
 }
 

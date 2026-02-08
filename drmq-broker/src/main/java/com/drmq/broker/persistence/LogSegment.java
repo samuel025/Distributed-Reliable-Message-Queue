@@ -16,10 +16,11 @@ import java.nio.file.StandardOpenOption;
  */
 public class LogSegment implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(LogSegment.class);
+    private static final int MAX_MESSAGE_SIZE = 10 * 1024 * 1024; // 10MB limit
 
     private final Path filePath;
     private final FileChannel fileChannel;
-    private long currentSize;
+    private volatile long currentSize; // volatile for thread-safe reads
 
     public LogSegment(Path filePath) throws IOException {
         this.filePath = filePath;
@@ -58,18 +59,47 @@ public class LogSegment implements AutoCloseable {
 
     /**
      * Read a message from the specified position.
+     * Handles short reads and validates message length to prevent OOM and corruption.
      * @param position The position to read from.
      * @return The stored message.
-     * @throws IOException If a read error occurs.
+     * @throws IOException If a read error occurs or data is corrupt.
      */
     public StoredMessage read(long position) throws IOException {
+        // Read 4-byte length prefix, handling short reads
         ByteBuffer lengthBuffer = ByteBuffer.allocate(4);
-        fileChannel.read(lengthBuffer, position);
+        int bytesRead = 0;
+        while (lengthBuffer.hasRemaining()) {
+            int read = fileChannel.read(lengthBuffer, position + bytesRead);
+            if (read == -1) {
+                throw new IOException("Unexpected EOF while reading message length at position " + position);
+            }
+            bytesRead += read;
+        }
         lengthBuffer.flip();
         int length = lengthBuffer.getInt();
+        
+        // Validate message length
+        if (length <= 0) {
+            throw new IOException("Invalid message length " + length + " at position " + position + 
+                                  ". Possible data corruption.");
+        }
+        if (length > MAX_MESSAGE_SIZE) {
+            throw new IOException("Message length " + length + " exceeds maximum allowed size " + 
+                                  MAX_MESSAGE_SIZE + " at position " + position + 
+                                  ". Possible data corruption or OOM attack.");
+        }
 
+        // Read message body, handling short reads
         ByteBuffer messageBuffer = ByteBuffer.allocate(length);
-        fileChannel.read(messageBuffer, position + 4);
+        bytesRead = 0;
+        while (messageBuffer.hasRemaining()) {
+            int read = fileChannel.read(messageBuffer, position + 4 + bytesRead);
+            if (read == -1) {
+                throw new IOException("Unexpected EOF while reading message body at position " + 
+                                      (position + 4) + ", expected " + length + " bytes, got " + bytesRead);
+            }
+            bytesRead += read;
+        }
         messageBuffer.flip();
 
         return StoredMessage.parseFrom(messageBuffer.array());
