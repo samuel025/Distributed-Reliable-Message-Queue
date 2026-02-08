@@ -37,9 +37,18 @@ public class LogSegment implements AutoCloseable {
      * @param message The message to append.
      * @return The starting position of the message in the file.
      * @throws IOException If a write error occurs.
+     * @throws IllegalArgumentException If message exceeds MAX_MESSAGE_SIZE.
      */
     public synchronized long append(StoredMessage message) throws IOException {
         byte[] messageBytes = message.toByteArray();
+        
+        // Validate message size to ensure it can be read back
+        if (messageBytes.length > MAX_MESSAGE_SIZE) {
+            throw new IllegalArgumentException(
+                "Message size " + messageBytes.length + " bytes exceeds maximum allowed size " + 
+                MAX_MESSAGE_SIZE + " bytes. Message cannot be persisted.");
+        }
+        
         ByteBuffer buffer = ByteBuffer.allocate(4 + messageBytes.length);
         buffer.putInt(messageBytes.length);
         buffer.put(messageBytes);

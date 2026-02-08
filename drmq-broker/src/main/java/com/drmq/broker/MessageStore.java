@@ -159,16 +159,46 @@ public class MessageStore {
 
     /**
      * Get messages from a topic starting at the given offset.
+     * First tries the in-memory cache, then falls back to disk if needed.
      */
     public List<StoredMessage> getMessages(String topic, long fromOffset, int maxCount) {
-        // For Phase 2, we'll leverage the cache if possible, or read from disk sequentially.
-        // Keeping it simple: filter the cache for now, as recovery loads everything into cache.
         BoundedMessageCache cache = messageCache.get(topic);
-        if (cache == null) {
+        
+        // Try cache first
+        if (cache != null) {
+            List<StoredMessage> cachedMessages = cache.getMessagesFrom(fromOffset, maxCount);
+            // If we got enough messages from cache, return them
+            if (cachedMessages.size() >= maxCount) {
+                return cachedMessages;
+            }
+        }
+        
+        // Cache miss or partial hit - need to read from disk
+        ConcurrentHashMap<Long, Long> index = topicIndex.get(topic);
+        if (index == null) {
             return Collections.emptyList();
         }
-
-        return cache.getMessagesFrom(fromOffset, maxCount);
+        
+        List<StoredMessage> result = new ArrayList<>();
+        
+        // Read messages from disk using the index
+        for (long offset = fromOffset; offset < fromOffset + maxCount * 10 && result.size() < maxCount; offset++) {
+            Long position = index.get(offset);
+            if (position != null) {
+                try {
+                    LogSegment segment = logManager.getOrCreateSegment(topic);
+                    StoredMessage message = segment.read(position);
+                    if (message.getOffset() >= fromOffset) {
+                        result.add(message);
+                    }
+                } catch (IOException e) {
+                    logger.warn("Error reading message at offset {} from disk: {}", offset, e.getMessage());
+                    // Continue trying to read other messages
+                }
+            }
+        }
+        
+        return result;
     }
 
     public long getCurrentOffset() {

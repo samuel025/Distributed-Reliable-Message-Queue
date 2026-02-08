@@ -42,6 +42,11 @@ public class LogManager implements AutoCloseable {
      */
     public LogSegment getOrCreateSegment(String topic) throws IOException {
         // Validate topic name to prevent path traversal and invalid characters
+        if (topic.equals(".") || topic.equals("..")) {
+            throw new IllegalArgumentException(
+                "Invalid topic name: '" + topic + "'. Topic names cannot be '.' or '..'");
+        }
+        
         if (!TOPIC_NAME_PATTERN.matcher(topic).matches()) {
             throw new IllegalArgumentException(
                 "Invalid topic name: '" + topic + "'. Topic names must match pattern: [A-Za-z0-9._-]+");
