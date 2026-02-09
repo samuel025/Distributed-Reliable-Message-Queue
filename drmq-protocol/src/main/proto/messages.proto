@@ -31,6 +31,20 @@ message StoredMessage {
     int64 stored_at = 6;      // Broker storage timestamp
 }
 
+// Request to consume messages from a topic
+message ConsumeRequest {
+    string topic = 1;
+    int64 from_offset = 2;    // Starting offset (inclusive)
+    int32 max_messages = 3;   // Maximum number of messages to fetch
+}
+
+// Response containing consumed messages
+message ConsumeResponse {
+    bool success = 1;
+    repeated StoredMessage messages = 2;  // List of messages
+    string error_message = 3;             // Error details if failed
+}
+
 // Envelope for TCP framing - wraps all messages with type info
 message MessageEnvelope {
     MessageType type = 1;
@@ -41,7 +55,6 @@ enum MessageType {
     UNKNOWN = 0;
     PRODUCE_REQUEST = 1;
     PRODUCE_RESPONSE = 2;
-    // Future message types
     CONSUME_REQUEST = 3;
     CONSUME_RESPONSE = 4;
     HEARTBEAT = 5;

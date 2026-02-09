@@ -75,6 +75,7 @@ public class ClientHandler implements Runnable {
     private MessageEnvelope handleMessage(MessageEnvelope envelope) throws IOException {
         return switch (envelope.getType()) {
             case PRODUCE_REQUEST -> handleProduceRequest(envelope);
+            case CONSUME_REQUEST -> handleConsumeRequest(envelope);
             default -> createErrorResponse("Unknown message type: " + envelope.getType());
         };
     }
@@ -109,14 +110,48 @@ public class ClientHandler implements Runnable {
 
         } catch (Exception e) {
             logger.error("Error processing produce request", e);
-            return createErrorResponse(e.getMessage());
+            return createProduceErrorResponse(e.getMessage());
         }
     }
 
     /**
-     * Create an error response envelope.
+     * Handle a consume request - fetch messages from the specified offset.
      */
-    private MessageEnvelope createErrorResponse(String errorMessage) {
+    private MessageEnvelope handleConsumeRequest(MessageEnvelope envelope) throws IOException {
+        try {
+            ConsumeRequest request = ConsumeRequest.parseFrom(envelope.getPayload());
+
+            String topic = request.getTopic();
+            long fromOffset = request.getFromOffset();
+            int maxMessages = request.getMaxMessages();
+
+            // Fetch messages from store
+            var messages = messageStore.getMessages(topic, fromOffset, maxMessages);
+
+            logger.debug("Consumed {} messages: topic={}, fromOffset={}", 
+                    messages.size(), topic, fromOffset);
+
+            // Build success response
+            ConsumeResponse response = ConsumeResponse.newBuilder()
+                    .setSuccess(true)
+                    .addAllMessages(messages)
+                    .build();
+
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.CONSUME_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+
+        } catch (Exception e) {
+            logger.error("Error processing consume request", e);
+            return createConsumeErrorResponse(e.getMessage());
+        }
+    }
+
+    /**
+     * Create an error response envelope for produce requests.
+     */
+    private MessageEnvelope createProduceErrorResponse(String errorMessage) {
         ProduceResponse response = ProduceResponse.newBuilder()
                 .setSuccess(false)
                 .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
@@ -126,6 +161,29 @@ public class ClientHandler implements Runnable {
                 .setType(MessageType.PRODUCE_RESPONSE)
                 .setPayload(response.toByteString())
                 .build();
+    }
+
+    /**
+     * Create an error response envelope for consume requests.
+     */
+    private MessageEnvelope createConsumeErrorResponse(String errorMessage) {
+        ConsumeResponse response = ConsumeResponse.newBuilder()
+                .setSuccess(false)
+                .setErrorMessage(errorMessage != null ? errorMessage : "Unknown error")
+                .build();
+
+        return MessageEnvelope.newBuilder()
+                .setType(MessageType.CONSUME_RESPONSE)
+                .setPayload(response.toByteString())
+                .build();
+    }
+
+    /**
+     * Create a generic error response envelope (deprecated - use specific error methods).
+     */
+    @Deprecated
+    private MessageEnvelope createErrorResponse(String errorMessage) {
+        return createProduceErrorResponse(errorMessage);
     }
 
     /**

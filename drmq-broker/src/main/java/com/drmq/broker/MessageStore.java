@@ -18,7 +18,6 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Message storage for the broker.
- * Phase 2: Implements persistence using Write-Ahead Logging (WAL) and an in-memory index.
  */
 public class MessageStore {
     private static final Logger logger = LoggerFactory.getLogger(MessageStore.class);
@@ -27,7 +26,6 @@ public class MessageStore {
     private final LogManager logManager;
 
     // Topic -> Offset -> Byte Position in log file
-    // Using ConcurrentSkipListMap for efficient sorted traversal of sparse offsets
     private final ConcurrentHashMap<String, ConcurrentSkipListMap<Long, Long>> topicIndex = new ConcurrentHashMap<>();
     
     // In-memory cache for recent messages (Topic -> BoundedMessageCache)
@@ -61,7 +59,6 @@ public class MessageStore {
                     long offset = message.getOffset();
                     
                     indexMessage(topic, offset, position);
-                    // Also add to cache during recovery for now
                     addToCache(topic, message);
                     
                     if (offset > maxOffset) {
