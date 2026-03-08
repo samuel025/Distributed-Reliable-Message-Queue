@@ -16,11 +16,13 @@ public class ClientHandler implements Runnable {
 
     private final Socket socket;
     private final MessageStore messageStore;
+    private final OffsetManager offsetManager;
     private volatile boolean running = true;
 
-    public ClientHandler(Socket socket, MessageStore messageStore) {
+    public ClientHandler(Socket socket, MessageStore messageStore, OffsetManager offsetManager) {
         this.socket = socket;
         this.messageStore = messageStore;
+        this.offsetManager = offsetManager;
     }
 
     @Override
@@ -76,6 +78,8 @@ public class ClientHandler implements Runnable {
         return switch (envelope.getType()) {
             case PRODUCE_REQUEST -> handleProduceRequest(envelope);
             case CONSUME_REQUEST -> handleConsumeRequest(envelope);
+            case COMMIT_OFFSET_REQUEST -> handleCommitOffsetRequest(envelope);
+            case FETCH_OFFSET_REQUEST -> handleFetchOffsetRequest(envelope);
             default -> createErrorResponse("Unknown message type: " + envelope.getType());
         };
     }
@@ -116,22 +120,38 @@ public class ClientHandler implements Runnable {
 
     /**
      * Handle a consume request - fetch messages from the specified offset.
+     * If timeout_ms > 0, uses long-polling: waits up to that duration for
+     * messages to arrive before returning an empty response.
      */
     private MessageEnvelope handleConsumeRequest(MessageEnvelope envelope) throws IOException {
         try {
             ConsumeRequest request = ConsumeRequest.parseFrom(envelope.getPayload());
 
-            String topic = request.getTopic();
-            long fromOffset = request.getFromOffset();
-            int maxMessages = request.getMaxMessages();
+            String topic      = request.getTopic();
+            long fromOffset   = request.getFromOffset();
+            int maxMessages   = request.getMaxMessages();
+            long timeoutMs    = request.getTimeoutMs(); // 0 = short poll
 
-            // Fetch messages from store
+            // Fetch messages — if timeout > 0, wait up to timeoutMs for messages
             var messages = messageStore.getMessages(topic, fromOffset, maxMessages);
 
-            logger.debug("Consumed {} messages: topic={}, fromOffset={}", 
-                    messages.size(), topic, fromOffset);
+            if (messages.isEmpty() && timeoutMs > 0) {
+                long deadline = System.currentTimeMillis() + timeoutMs;
+                while (messages.isEmpty() && System.currentTimeMillis() < deadline) {
+                    try {
+                        Thread.sleep(50); // check every 50ms
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    messages = messageStore.getMessages(topic, fromOffset, maxMessages);
+                }
+                logger.debug("Long-poll finished: topic={}, fromOffset={}, messages={}, waited={}ms",
+                        topic, fromOffset, messages.size(), timeoutMs - Math.max(0, deadline - System.currentTimeMillis()));
+            } else {
+                logger.debug("Consumed {} messages: topic={}, fromOffset={}", messages.size(), topic, fromOffset);
+            }
 
-            // Build success response
             ConsumeResponse response = ConsumeResponse.newBuilder()
                     .setSuccess(true)
                     .addAllMessages(messages)
@@ -176,6 +196,80 @@ public class ClientHandler implements Runnable {
                 .setType(MessageType.CONSUME_RESPONSE)
                 .setPayload(response.toByteString())
                 .build();
+    }
+
+    /**
+     * Handle a commit offset request - store the consumer group offset on the broker.
+     */
+    private MessageEnvelope handleCommitOffsetRequest(MessageEnvelope envelope) throws IOException {
+        try {
+            CommitOffsetRequest request = CommitOffsetRequest.parseFrom(envelope.getPayload());
+
+            String group = request.getConsumerGroup();
+            String topic = request.getTopic();
+            long offset  = request.getOffset();
+
+            offsetManager.commit(group, topic, offset);
+
+            logger.debug("Committed offset: group={}, topic={}, offset={}", group, topic, offset);
+
+            CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
+                    .setSuccess(true)
+                    .build();
+
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.COMMIT_OFFSET_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+
+        } catch (Exception e) {
+            logger.error("Error committing offset", e);
+            CommitOffsetResponse response = CommitOffsetResponse.newBuilder()
+                    .setSuccess(false)
+                    .setErrorMessage(e.getMessage() != null ? e.getMessage() : "Unknown error")
+                    .build();
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.COMMIT_OFFSET_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        }
+    }
+
+    /**
+     * Handle a fetch offset request - return the committed offset for a consumer group.
+     */
+    private MessageEnvelope handleFetchOffsetRequest(MessageEnvelope envelope) throws IOException {
+        try {
+            FetchOffsetRequest request = FetchOffsetRequest.parseFrom(envelope.getPayload());
+
+            String group = request.getConsumerGroup();
+            String topic = request.getTopic();
+            long offset  = offsetManager.fetch(group, topic);
+
+            logger.debug("Fetched offset: group={}, topic={}, offset={}", group, topic, offset);
+
+            FetchOffsetResponse response = FetchOffsetResponse.newBuilder()
+                    .setSuccess(true)
+                    .setOffset(offset)
+                    .build();
+
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.FETCH_OFFSET_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+
+        } catch (Exception e) {
+            logger.error("Error fetching offset", e);
+            FetchOffsetResponse response = FetchOffsetResponse.newBuilder()
+                    .setSuccess(false)
+                    .setOffset(-1)
+                    .setErrorMessage(e.getMessage() != null ? e.getMessage() : "Unknown error")
+                    .build();
+            return MessageEnvelope.newBuilder()
+                    .setType(MessageType.FETCH_OFFSET_RESPONSE)
+                    .setPayload(response.toByteString())
+                    .build();
+        }
     }
 
     /**

@@ -36,6 +36,7 @@ message ConsumeRequest {
     string topic = 1;
     int64 from_offset = 2;    // Starting offset (inclusive)
     int32 max_messages = 3;   // Maximum number of messages to fetch
+    int64 timeout_ms = 4;     // Long-poll timeout (0 = return immediately)
 }
 
 // Response containing consumed messages
@@ -43,6 +44,32 @@ message ConsumeResponse {
     bool success = 1;
     repeated StoredMessage messages = 2;  // List of messages
     string error_message = 3;             // Error details if failed
+}
+
+// Request to commit a consumer group's offset for a topic
+message CommitOffsetRequest {
+    string consumer_group = 1;
+    string topic = 2;
+    int64 offset = 3;   // The next offset to read (last processed + 1)
+}
+
+// Response to a commit offset request
+message CommitOffsetResponse {
+    bool success = 1;
+    string error_message = 2;
+}
+
+// Request to fetch a consumer group's committed offset for a topic
+message FetchOffsetRequest {
+    string consumer_group = 1;
+    string topic = 2;
+}
+
+// Response with the committed offset
+message FetchOffsetResponse {
+    bool success = 1;
+    int64 offset = 2;         // The committed offset, or -1 if none exists
+    string error_message = 3;
 }
 
 // Envelope for TCP framing - wraps all messages with type info
@@ -58,4 +85,8 @@ enum MessageType {
     CONSUME_REQUEST = 3;
     CONSUME_RESPONSE = 4;
     HEARTBEAT = 5;
+    COMMIT_OFFSET_REQUEST = 6;
+    COMMIT_OFFSET_RESPONSE = 7;
+    FETCH_OFFSET_REQUEST = 8;
+    FETCH_OFFSET_RESPONSE = 9;
 }

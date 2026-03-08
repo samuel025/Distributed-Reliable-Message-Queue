@@ -28,6 +28,7 @@ public class BrokerServer {
     private final ExecutorService executor;
     private final MessageStore messageStore;
     private final LogManager logManager;
+    private final OffsetManager offsetManager;
     private final List<ClientHandler> activeHandlers = new ArrayList<>();
 
     private ServerSocket serverSocket;
@@ -39,6 +40,7 @@ public class BrokerServer {
         this.executor = Executors.newFixedThreadPool(threadPoolSize);
         this.logManager = new LogManager(dataDir);
         this.messageStore = new MessageStore(logManager);
+        this.offsetManager = new OffsetManager(dataDir);
     }
 
     public BrokerServer(int port, int threadPoolSize) throws IOException {
@@ -53,7 +55,6 @@ public class BrokerServer {
      * Start the broker server. Blocks until shutdown.
      */
     public void start() throws IOException {
-        // Recovery phase
         try {
             messageStore.recover();
         } catch (IOException e) {
@@ -69,7 +70,7 @@ public class BrokerServer {
         while (running) {
             try {
                 Socket clientSocket = serverSocket.accept();
-                ClientHandler handler = new ClientHandler(clientSocket, messageStore);
+                ClientHandler handler = new ClientHandler(clientSocket, messageStore, offsetManager);
                 
                 synchronized (activeHandlers) {
                     activeHandlers.add(handler);
@@ -142,6 +143,7 @@ public class BrokerServer {
             logger.error("Error closing log manager", e);
         }
 
+
         // Shutdown executor
         executor.shutdown();
         try {
@@ -190,10 +192,7 @@ public class BrokerServer {
 
         try {
             BrokerServer broker = new BrokerServer(port, DEFAULT_THREAD_POOL_SIZE, dataDir);
-            
-            // Add shutdown hook for graceful shutdown
             Runtime.getRuntime().addShutdownHook(new Thread(broker::shutdown));
-            
             broker.start();
         } catch (IOException e) {
             logger.error("Failed to start broker", e);

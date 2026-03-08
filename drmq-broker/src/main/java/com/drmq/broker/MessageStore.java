@@ -53,7 +53,6 @@ public class MessageStore {
             try (LogSegment segment = new LogSegment(logPath)) {
                 long position = 0;
                 long segmentSize = segment.getSize();
-                
                 while (position < segmentSize) {
                     StoredMessage message = segment.read(position);
                     long offset = message.getOffset();
