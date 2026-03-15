@@ -11,23 +11,27 @@ import com.drmq.client.DRMQConsumer;
  *
  * Usage:
  *   mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp"
- *   mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp" -Dexec.args="my-service"
+ *   mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp" -Dexec.args="localhost:9092,localhost:9093,localhost:9094"
+ *   mvn exec:java -Dexec.mainClass="com.drmq.client.commandLineExample.ConsumerApp" -Dexec.args="localhost:9092,localhost:9093,localhost:9094 my-service"
  */
 public class ConsumerApp {
     public static void main(String[] args) {
-        // Consumer group can be passed as a CLI argument (default: "default")
-        String consumerGroup = args.length > 0 ? args[0] : "default";
+        // First arg: bootstrap servers (default: localhost:9092)
+        // Second arg: consumer group (default: "default")
+        String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092";
+        String consumerGroup = args.length > 1 ? args[1] : "default";
 
         System.out.println("╔════════════════════════════════════════╗");
         System.out.println("║     DRMQ Interactive Consumer CLI     ║");
         System.out.println("╚════════════════════════════════════════╝");
-        System.out.printf( "  Consumer Group: %-23s\n\n", "[" + consumerGroup + "]");
+        System.out.printf( "  Consumer Group: %-23s\n", "[" + consumerGroup + "]");
+        System.out.printf( "  Servers: %-30s\n\n", bootstrapServers);
 
-        try (DRMQConsumer consumer = new DRMQConsumer(consumerGroup);
+        try (DRMQConsumer consumer = new DRMQConsumer(bootstrapServers, consumerGroup);
              Scanner scanner = new Scanner(System.in)) {
 
             consumer.connect();
-            System.out.println("✓ Connected to broker at localhost:9092");
+            System.out.println("✓ Connected to broker");
             System.out.printf( "✓ Offsets tracked by broker for group '%s'\n\n", consumerGroup);
 
             printHelp();
@@ -206,3 +210,4 @@ public class ConsumerApp {
         System.out.println("─────────────────────────────────────────\n");
     }
 }
+

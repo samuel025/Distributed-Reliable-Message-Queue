@@ -78,6 +78,45 @@ message MessageEnvelope {
     bytes payload = 2;  // Serialized inner message
 }
 
+// --- Raft log entry (wraps a user message for Raft replication) ---
+message RaftEntry {
+    int64 term = 1;           // Term in which the entry was created
+    int64 index = 2;          // Position in the Raft log (1-indexed)
+    string topic = 3;         // Target topic for the message
+    bytes payload = 4;        // Message payload
+    optional string key = 5;  // Optional message key
+    int64 timestamp = 6;      // Client-side timestamp
+}
+
+// --- Raft leader election ---
+message RequestVoteRequest {
+    int64 term = 1;              // Candidate's term
+    string candidate_id = 2;    // Candidate requesting vote
+    int64 last_log_index = 3;   // Index of candidate's last log entry
+    int64 last_log_term = 4;    // Term of candidate's last log entry
+}
+
+message RequestVoteResponse {
+    int64 term = 1;           // Current term, for candidate to update itself
+    bool vote_granted = 2;    // True = vote granted
+}
+
+// --- Raft log replication (also used as heartbeat when entries is empty) ---
+message AppendEntriesRequest {
+    int64 term = 1;                   // Leader's term
+    string leader_id = 2;            // So followers know who the leader is
+    int64 prev_log_index = 3;        // Index of log entry immediately preceding new ones
+    int64 prev_log_term = 4;         // Term of prevLogIndex entry
+    repeated RaftEntry entries = 5;  // Log entries to store (empty for heartbeat)
+    int64 leader_commit = 6;         // Leader's commitIndex
+}
+
+message AppendEntriesResponse {
+    int64 term = 1;           // Current term, for leader to update itself
+    bool success = 2;         // True if follower contained entry matching prevLogIndex/prevLogTerm
+    int64 match_index = 3;    // Follower's last replicated index (for leader's matchIndex tracking)
+}
+
 enum MessageType {
     UNKNOWN = 0;
     PRODUCE_REQUEST = 1;
@@ -89,4 +128,9 @@ enum MessageType {
     COMMIT_OFFSET_RESPONSE = 7;
     FETCH_OFFSET_REQUEST = 8;
     FETCH_OFFSET_RESPONSE = 9;
+    // Raft RPCs
+    REQUEST_VOTE_REQUEST = 10;
+    REQUEST_VOTE_RESPONSE = 11;
+    APPEND_ENTRIES_REQUEST = 12;
+    APPEND_ENTRIES_RESPONSE = 13;
 }

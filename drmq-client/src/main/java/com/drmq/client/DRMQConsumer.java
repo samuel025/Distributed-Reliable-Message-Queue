@@ -14,7 +14,10 @@ import java.util.Map;
 /**
  * DRMQ Consumer client for reading messages from topics.
  *
- * Phase 4: Offsets are now stored on the broker per consumer group.
+ * Supports bootstrap servers: provide multiple broker addresses so the consumer
+ * can automatically failover to another broker if the current one dies.
+ *
+ * Offsets are stored on the broker per consumer group.
  * On subscribe(), the consumer fetches its last committed offset from the
  * broker and resumes from there. After each poll(), the new offset is
  * automatically committed back to the broker.
@@ -24,17 +27,19 @@ public class DRMQConsumer implements AutoCloseable {
     private static final int DEFAULT_PORT = 9092;
     private static final int DEFAULT_MAX_MESSAGES = 100;
     private static final String DEFAULT_CONSUMER_GROUP = "default";
-    /** Default long-poll wait on the broker side when no messages are available. */
     private static final long DEFAULT_POLL_TIMEOUT_MS = 1000;
+    private static final int MAX_RETRIES = 5;
 
-    private final String host;
-    private final int port;
+    private String host;
+    private int port;
     private final String consumerGroup;
+    private final List<String[]> bootstrapServers;
+    private int currentServerIndex = 0;
 
     private Socket socket;
     private DataInputStream inputStream;
     private DataOutputStream outputStream;
-    private boolean connected = false;
+    private volatile boolean connected = false;
 
     // Local cache of current offset per topic (source of truth is the broker)
     private final Map<String, Long> topicOffsets = new HashMap<>();
@@ -60,6 +65,28 @@ public class DRMQConsumer implements AutoCloseable {
         this.host = host;
         this.port = port;
         this.consumerGroup = consumerGroup;
+        this.bootstrapServers = new ArrayList<>();
+        this.bootstrapServers.add(new String[]{host, String.valueOf(port)});
+    }
+
+    /**
+     * Create a consumer with multiple bootstrap servers for failover.
+     * Format: "host1:port1,host2:port2,host3:port3"
+     */
+    public DRMQConsumer(String bootstrapServersStr, String consumerGroup) {
+        this.consumerGroup = consumerGroup;
+        this.bootstrapServers = new ArrayList<>();
+        for (String server : bootstrapServersStr.split(",")) {
+            String[] parts = server.trim().split(":");
+            if (parts.length == 2) {
+                bootstrapServers.add(parts);
+            }
+        }
+        if (bootstrapServers.isEmpty()) {
+            throw new IllegalArgumentException("No valid bootstrap servers: " + bootstrapServersStr);
+        }
+        this.host = bootstrapServers.get(0)[0];
+        this.port = Integer.parseInt(bootstrapServers.get(0)[1]);
     }
 
     // -------------------------------------------------------------------------
@@ -77,6 +104,60 @@ public class DRMQConsumer implements AutoCloseable {
         connected = true;
 
         logger.info("Connected to DRMQ broker at {}:{} as group '{}'", host, port, consumerGroup);
+    }
+
+    /**
+     * Close and reopen the connection, cycling to the next bootstrap server.
+     */
+    private void reconnect() throws IOException {
+        closeConnection();
+        rotateToNextServer();
+        // Try each server up to MAX_RETRIES times
+        IOException lastException = null;
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            try {
+                connect();
+                // Re-subscribe to all topics on the new broker
+                for (Map.Entry<String, Long> entry : topicOffsets.entrySet()) {
+                    logger.info("Re-subscribing to topic '{}' at offset {} on new broker",
+                            entry.getKey(), entry.getValue());
+                }
+                return;
+            } catch (IOException e) {
+                logger.warn("Reconnect to {}:{} failed (attempt {}/{}): {}",
+                        host, port, attempt + 1, MAX_RETRIES, e.getMessage());
+                lastException = e;
+                rotateToNextServer();
+                try { Thread.sleep(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted during reconnect", ie);
+                }
+            }
+        }
+        throw new IOException("Failed to reconnect after " + MAX_RETRIES + " attempts: " +
+                (lastException != null ? lastException.getMessage() : "unknown error"));
+    }
+
+    /**
+     * Rotate to the next bootstrap server in the list.
+     */
+    private void rotateToNextServer() {
+        if (bootstrapServers.size() <= 1) return;
+        currentServerIndex = (currentServerIndex + 1) % bootstrapServers.size();
+        String[] next = bootstrapServers.get(currentServerIndex);
+        this.host = next[0];
+        this.port = Integer.parseInt(next[1]);
+        logger.info("Switching to next broker: {}:{}", host, port);
+    }
+
+    /**
+     * Close the current connection without closing the consumer.
+     */
+    private void closeConnection() {
+        connected = false;
+        try { if (inputStream != null) inputStream.close(); } catch (IOException ignored) {}
+        try { if (outputStream != null) outputStream.close(); } catch (IOException ignored) {}
+        try { if (socket != null && !socket.isClosed()) socket.close(); } catch (IOException ignored) {}
     }
 
     // -------------------------------------------------------------------------
@@ -105,7 +186,7 @@ public class DRMQConsumer implements AutoCloseable {
     }
 
     // -------------------------------------------------------------------------
-    // Poll (auto-commits offset after fetching)
+    // Poll (auto-commits offset after fetching, with reconnect on failure)
     // -------------------------------------------------------------------------
 
     public List<ConsumedMessage> poll() throws IOException {
@@ -118,6 +199,7 @@ public class DRMQConsumer implements AutoCloseable {
 
     /**
      * Poll for messages with a specific max count and long-poll timeout.
+     * Automatically reconnects to another broker if the connection is lost.
      *
      * @param maxMessages maximum number of messages to fetch per topic
      * @param timeoutMs   how long the broker should wait for messages before
@@ -127,24 +209,35 @@ public class DRMQConsumer implements AutoCloseable {
         if (!connected) connect();
 
         synchronized (pollLock) {
-            List<ConsumedMessage> allMessages = new ArrayList<>();
-
-            for (Map.Entry<String, Long> entry : topicOffsets.entrySet()) {
-                String topic = entry.getKey();
-                long fromOffset = entry.getValue();
-
-                List<ConsumedMessage> messages = fetchMessages(topic, fromOffset, maxMessages, timeoutMs);
-                allMessages.addAll(messages);
-
-                if (!messages.isEmpty()) {
-                    long nextOffset = messages.get(messages.size() - 1).offset() + 1;
-                    topicOffsets.put(topic, nextOffset);
-                    commitOffsetToBroker(topic, nextOffset);
-                }
+            try {
+                return doPoll(maxMessages, timeoutMs);
+            } catch (IOException e) {
+                // Connection broken — reconnect and retry once
+                logger.warn("Poll failed ({}), reconnecting to another broker...", e.getMessage());
+                reconnect();
+                return doPoll(maxMessages, timeoutMs);
             }
-
-            return allMessages;
         }
+    }
+
+    private List<ConsumedMessage> doPoll(int maxMessages, long timeoutMs) throws IOException {
+        List<ConsumedMessage> allMessages = new ArrayList<>();
+
+        for (Map.Entry<String, Long> entry : topicOffsets.entrySet()) {
+            String topic = entry.getKey();
+            long fromOffset = entry.getValue();
+
+            List<ConsumedMessage> messages = fetchMessages(topic, fromOffset, maxMessages, timeoutMs);
+            allMessages.addAll(messages);
+
+            if (!messages.isEmpty()) {
+                long nextOffset = messages.get(messages.size() - 1).offset() + 1;
+                topicOffsets.put(topic, nextOffset);
+                commitOffsetToBroker(topic, nextOffset);
+            }
+        }
+
+        return allMessages;
     }
 
     // -------------------------------------------------------------------------
